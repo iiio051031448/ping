@@ -14,10 +14,8 @@
 #include <sys/syscall.h>
 #include <arpa/inet.h>
 
-
-
 enum {
-    DEFDATALEN = 56,
+    DEF_DATALEN = 56,
     MAXIPLEN = 60,
     MAXICMPLEN = 76,
     MAX_DUP_CHK = (8 * 128),
@@ -32,16 +30,20 @@ static unsigned char rcvd_tbl[MAX_DUP_CHK / 8] = {0};
 #define SET(bit)    (BYTE(bit) |= MASK(bit))
 #define CLR(bit)    (BYTE(bit) &= (~MASK(bit)))
 #define TST(bit)    (BYTE(bit) & MASK(bit))
-static unsigned long ntransmitted = 0;
-static int myid = 0;
 
-static struct sockaddr_in dest_addr;
+typedef struct popt_tag {
+    int sock;
+    int recv_len;
+    int datalen;
+    char *recv_pkt;
+    int snd_len;
+    char *snd_packet;
+    int myid;
+    struct sockaddr_in dest_addr;
+    unsigned long ntransmitted;
+}popt;
 
-union {
-    struct sockaddr sa;
-    struct sockaddr_in sin;
-} pingaddr;
-
+static popt g_popt = {0};
 
 int setsockopt_int(int fd, int level, int optname, int optval)
 {
@@ -111,12 +113,6 @@ unsigned long long monotonic_us(void)
 
 uint16_t inet_cksum(uint16_t *addr, int nleft)
 {
-    /*
-     * Our algorithm is simple, using a 32 bit accumulator,
-     * we add sequential 16 bit words to it, and at the end, fold
-     * back all the carry bits from the top 16 bits into the lower
-     * 16 bits.
-     */
     unsigned sum = 0;
     while (nleft > 1) {
         sum += *addr++;
@@ -139,16 +135,16 @@ uint16_t inet_cksum(uint16_t *addr, int nleft)
 }
 
 
-static void sendping_tail(int sock, char *snd_packet, int size_pkt, int datalen)
+static void sendping_tail(int sock, int size_pkt)
 {
     int sz;
 
-    CLR((uint16_t)ntransmitted % MAX_DUP_CHK);
-    ntransmitted++;
+    CLR((uint16_t)g_popt.ntransmitted % MAX_DUP_CHK);
+    g_popt.ntransmitted++;
 
-    size_pkt += datalen;
+    size_pkt += g_popt.datalen;
 
-    sz = sendto(sock, snd_packet, size_pkt, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    sz = sendto(sock, g_popt.snd_packet, size_pkt, 0, (struct sockaddr *)&g_popt.dest_addr, sizeof(g_popt.dest_addr));
     if (sz != size_pkt) {
         perror("sendto:");
         printf("sendto error\n");
@@ -158,28 +154,28 @@ static void sendping_tail(int sock, char *snd_packet, int size_pkt, int datalen)
     return;
 }
 
-static void sendping4(int sock, char *snd_packet, int snd_len, int datalen)
+static void sendping4(int sock)
 {
-    struct icmp *pkt = (struct icmp*)snd_packet;
+    struct icmp *pkt = (struct icmp*)g_popt.snd_packet;
 
-    memset(pkt, 0xA5, snd_len);
+    memset(pkt, 0xA5, g_popt.snd_len);
     pkt->icmp_type = ICMP_ECHO;
     /* pkt->icmp_code = 0; */
     pkt->icmp_code = 0;
     pkt->icmp_cksum = 0; /* cksum is calculated with this field set to 0 */
-    pkt->icmp_seq = htons(ntransmitted); /* don't ++ here, it can be a macro */
-    pkt->icmp_id = myid;
+    pkt->icmp_seq = htons(g_popt.ntransmitted); /* don't ++ here, it can be a macro */
+    pkt->icmp_id = g_popt.myid;
 
-    /* If datalen < 4, we store timestamp _past_ the packet,
+    /* If g_popt.datalen < 4, we store timestamp _past_ the packet,
      *   * but it's ok - we allocated 4 extra bytes in xzalloc() just in case.
      *       */
-    /*if (datalen >= 4)*/
+    /*if (g_popt.datalen >= 4)*/
     /* No hton: we'll read it back on the same machine */
     *(uint32_t*)&pkt->icmp_dun = monotonic_us();
 
-    pkt->icmp_cksum = inet_cksum((uint16_t *) pkt, datalen + ICMP_MINLEN);
+    pkt->icmp_cksum = inet_cksum((uint16_t *) pkt, g_popt.datalen + ICMP_MINLEN);
 
-    sendping_tail(sock, snd_packet, ICMP_MINLEN, datalen);
+    sendping_tail(sock, ICMP_MINLEN);
 }
 
 static const char *icmp_type_name(int id)
@@ -202,14 +198,14 @@ static const char *icmp_type_name(int id)
     }
 }
 
-static void unpack4(char *buf, int sz, struct sockaddr_in *from, int datalen)
+static void unpack4(char *buf, int sz, struct sockaddr_in *from)
 {
     struct icmp *icmppkt;
     struct iphdr *iphdr;
     int hlen;
 
     /* discard if too short */
-    if (sz < (datalen + ICMP_MINLEN))
+    if (sz < (g_popt.datalen + ICMP_MINLEN))
         return;
 
     /* check IP header */
@@ -217,7 +213,7 @@ static void unpack4(char *buf, int sz, struct sockaddr_in *from, int datalen)
     hlen = iphdr->ihl << 2;
     sz -= hlen;
     icmppkt = (struct icmp *) (buf + hlen);
-    if (icmppkt->icmp_id != myid)
+    if (icmppkt->icmp_id != g_popt.myid)
         return;             /* not our ping */
 
     if (icmppkt->icmp_type == ICMP_ECHOREPLY) {
@@ -236,16 +232,18 @@ static void unpack4(char *buf, int sz, struct sockaddr_in *from, int datalen)
 
 int main(void)
 {
+    #if 0
     int sock = -1;
-    int recv_len = 0;
-    int datalen = 16;
-    char *recv_pkt = NULL;
+    int g_popt.recv_len = 0;
+    int g_popt.datalen = 16;
+    char *g_port.recv_pkt = NULL;
     int pingcount = 0;
+    #endif
 
-    myid = (uint16_t) getpid();
+    g_popt.myid = (uint16_t) getpid();
 
-    memset(&dest_addr, 0, sizeof(dest_addr));                                          
-    dest_addr.sin_family = AF_INET;                                                
+    memset(&g_popt.dest_addr, 0, sizeof(g_popt.dest_addr));                                          
+    g_popt.dest_addr.sin_family = AF_INET;                                                
 
     struct hostent *host;
     host=gethostbyname("qq.com");
@@ -254,8 +252,8 @@ int main(void)
         return -1;                                                                 
     }                                                                              
 
-    //memcpy((char*)host->h_addr,(char*)&dest_addr.sin_addr, host->h_length);        
-    memcpy((char*)&dest_addr.sin_addr, (char*)host->h_addr, host->h_length);        
+    //memcpy((char*)host->h_addr,(char*)&g_popt.dest_addr.sin_addr, host->h_length);        
+    memcpy((char*)&g_popt.dest_addr.sin_addr, (char*)host->h_addr, host->h_length);        
 
     printf("\tofficial: %s\n", host->h_name);
 
@@ -263,56 +261,50 @@ int main(void)
     char str[32];
     pptr = host->h_addr_list;
     for (; *pptr!=NULL; pptr++) {
-        printf("\taddress: %s\n",
-                inet_ntop(host->h_addrtype, host->h_addr, str, sizeof(str)));
+        printf("\taddress: %s\n", inet_ntop(host->h_addrtype, host->h_addr, str, sizeof(str)));
     }
 
-
-
-    //sock = socket(AF_INET, SOCK_RAW, 1); /* 1 == ICMP */
-    sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP); /* 1 == ICMP */
-    if (sock < 0) {
-        perror("sock");
+    g_popt.sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP); /* 1 == ICMP */
+    if (g_popt.sock < 0) {
+        perror("g_popt.sock");
         printf("socket failed.\n");
         return -1;
     }
 
-    recv_len = datalen + MAXIPLEN + MAXICMPLEN;
+    g_popt.recv_len = g_popt.datalen + MAXIPLEN + MAXICMPLEN;
 
-    recv_pkt = malloc(recv_len);
-    if (!recv_pkt) {
+    g_popt.recv_pkt = malloc(g_popt.recv_len);
+    if (!g_popt.recv_pkt) {
     }
-    memset(recv_pkt, 0, recv_len);
+    memset(g_popt.recv_pkt, 0, g_popt.recv_len);
 
-    int snd_len = datalen + ICMP_MINLEN + 4;
-    char *snd_packet = malloc(snd_len);
-    if (!snd_packet) {
+    g_popt.snd_len = g_popt.datalen + ICMP_MINLEN + 4;
+    g_popt.snd_packet = malloc(g_popt.snd_len);
+    if (!g_popt.snd_packet) {
     }
-    memset(snd_packet, 0, snd_len);
+    memset(g_popt.snd_packet, 0, g_popt.snd_len);
 
-
-    setsockopt_broadcast(sock);
+    setsockopt_broadcast(g_popt.sock);
 
     int sockopt = 0;
-    sockopt = (datalen * 2) + 7 * 1024; /* giving it a bit of extra room */
-    setsockopt_SOL_SOCKET_int(sock, SO_RCVBUF, sockopt);
+    sockopt = (g_popt.datalen * 2) + 7 * 1024; /* giving it a bit of extra room */
+    setsockopt_SOL_SOCKET_int(g_popt.sock, SO_RCVBUF, sockopt);
 
-    sendping4(sock, snd_packet, snd_len, datalen);
+    sendping4(g_popt.sock);
 
-    //while (1) {
     do {
         struct sockaddr_in from;
         socklen_t fromlen = (socklen_t) sizeof(from);
         int c;
 
         printf("recvfrom ..... \n");
-        c = recvfrom(sock, recv_pkt, recv_len, 0, (struct sockaddr *) &from, &fromlen);
+        c = recvfrom(g_popt.sock, g_popt.recv_pkt, g_popt.recv_len, 0, (struct sockaddr *) &from, &fromlen);
         if (c < 0) {
             if (errno != EINTR) {
                 printf("recvfrom error\n");
             }
         }
-        unpack4(recv_pkt, c, &from, datalen);
+        unpack4(g_popt.recv_pkt, c, &from);
     } while(0);
 
     return 0;
