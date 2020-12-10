@@ -26,18 +26,16 @@ enum {
     pingsock = 0,
 };
 
-unsigned char rcvd_tbl[MAX_DUP_CHK / 8] = {0};
+static unsigned char rcvd_tbl[MAX_DUP_CHK / 8] = {0};
 #define BYTE(bit)   rcvd_tbl[(bit)>>3]
 #define MASK(bit)   (1 << ((bit) & 7))
 #define SET(bit)    (BYTE(bit) |= MASK(bit))
 #define CLR(bit)    (BYTE(bit) &= (~MASK(bit)))
 #define TST(bit)    (BYTE(bit) & MASK(bit))
-unsigned tmin, tmax; /* in us */
-unsigned long long tsum; /* in us, sum of all times */
-unsigned long ntransmitted, nreceived, nrepeats;
-int myid = 0;
+static unsigned long ntransmitted = 0;
+static int myid = 0;
 
-struct sockaddr_in dest_addr,recv_addr;
+static struct sockaddr_in dest_addr;
 
 union {
     struct sockaddr sa;
@@ -150,9 +148,6 @@ static void sendping_tail(int sock, char *snd_packet, int size_pkt, int datalen)
 
     size_pkt += datalen;
 
-    /* sizeof(pingaddr) can be larger than real sa size, but I think
-     *   * it doesn't matter */
-    //sz = xsendto(pingsock, G.snd_packet, size_pkt, &pingaddr.sa, sizeof(pingaddr));
     sz = sendto(sock, snd_packet, size_pkt, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     if (sz != size_pkt) {
         perror("sendto:");
@@ -180,7 +175,7 @@ static void sendping4(int sock, char *snd_packet, int snd_len, int datalen)
      *       */
     /*if (datalen >= 4)*/
     /* No hton: we'll read it back on the same machine */
-    //*(uint32_t*)&pkt->icmp_dun = monotonic_us();
+    *(uint32_t*)&pkt->icmp_dun = monotonic_us();
 
     pkt->icmp_cksum = inet_cksum((uint16_t *) pkt, datalen + ICMP_MINLEN);
 
@@ -207,46 +202,6 @@ static const char *icmp_type_name(int id)
     }
 }
 
-static void unpack_tail(int sz, uint32_t *tp,
-        const char *from_str,
-                uint16_t recv_seq, int ttl)
-{
-    unsigned char *b, m;
-    const char *dupmsg = " (DUP!)";
-    unsigned triptime = triptime; /* for gcc */
-
-    if (tp) {
-        /* (int32_t) cast is for hypothetical 64-bit unsigned */
-        /* (doesn't hurt 32-bit real-world anyway) */
-        triptime = (int32_t) ((uint32_t)monotonic_us() - *tp);
-        tsum += triptime;
-        if (triptime < tmin)
-            tmin = triptime;
-        if (triptime > tmax)
-            tmax = triptime;
-    }
-
-    b = &BYTE(recv_seq % MAX_DUP_CHK);
-    m = MASK(recv_seq % MAX_DUP_CHK);
-    /*if TST(recv_seq % MAX_DUP_CHK):*/
-    if (*b & m) {
-        ++nrepeats;
-    } else {
-        /*SET(recv_seq % MAX_DUP_CHK):*/
-        *b |= m;
-        ++nreceived;
-        dupmsg += 7;
-    }
-
-    printf("%d bytes from %s: seq=%u ttl=%d", sz,
-            from_str, recv_seq, ttl);
-    if (tp)
-        printf(" time=%u.%03u ms", triptime / 1000, triptime % 1000);
-    puts(dupmsg);
-    fflush(NULL);
-    return;
-}
-
 static void unpack4(char *buf, int sz, struct sockaddr_in *from, int datalen)
 {
     struct icmp *icmppkt;
@@ -271,10 +226,12 @@ static void unpack4(char *buf, int sz, struct sockaddr_in *from, int datalen)
 
         if (sz >= ICMP_MINLEN + sizeof(uint32_t))
             tp = (uint32_t *) icmppkt->icmp_data;
-        unpack_tail(sz, tp, inet_ntoa(*(struct in_addr *) &from->sin_addr.s_addr), recv_seq, iphdr->ttl);
+        printf("GOT ICMP_ECHOREPLY\n");
     } else if (icmppkt->icmp_type != ICMP_ECHO) {
         printf("warning: got ICMP %d (%s)\n", icmppkt->icmp_type, icmp_type_name(icmppkt->icmp_type));
     }
+
+    return;
 }
 
 int main(void)
@@ -354,15 +311,8 @@ int main(void)
             if (errno != EINTR) {
                 printf("recvfrom error\n");
             }
-            goto _continue;
         }
         unpack4(recv_pkt, c, &from, datalen);
-        #if 0
-        if (pingcount && nreceived >= pingcount)
-            break;
-        #endif
-_continue:
-        //sleep(1);
     } while(0);
 
     return 0;
