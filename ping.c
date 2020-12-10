@@ -135,23 +135,23 @@ uint16_t inet_cksum(uint16_t *addr, int nleft)
 }
 
 
-static void sendping_tail(int sock, int size_pkt)
+static int sendping_tail(void)
 {
     int sz;
 
     CLR((uint16_t)g_popt.ntransmitted % MAX_DUP_CHK);
     g_popt.ntransmitted++;
 
-    size_pkt += g_popt.datalen;
+    int size_pkt = ICMP_MINLEN + g_popt.datalen;
 
-    sz = sendto(sock, g_popt.snd_packet, size_pkt, 0, (struct sockaddr *)&g_popt.dest_addr, sizeof(g_popt.dest_addr));
+    sz = sendto(g_popt.sock, g_popt.snd_packet, size_pkt, 0, (struct sockaddr *)&g_popt.dest_addr, sizeof(g_popt.dest_addr));
     if (sz != size_pkt) {
         perror("sendto:");
         printf("sendto error\n");
-        return;
+        return -1;
     }
 
-    return;
+    return 0;
 }
 
 static void sendping4(int sock)
@@ -160,7 +160,6 @@ static void sendping4(int sock)
 
     memset(pkt, 0xA5, g_popt.snd_len);
     pkt->icmp_type = ICMP_ECHO;
-    /* pkt->icmp_code = 0; */
     pkt->icmp_code = 0;
     pkt->icmp_cksum = 0; /* cksum is calculated with this field set to 0 */
     pkt->icmp_seq = htons(g_popt.ntransmitted); /* don't ++ here, it can be a macro */
@@ -175,7 +174,7 @@ static void sendping4(int sock)
 
     pkt->icmp_cksum = inet_cksum((uint16_t *) pkt, g_popt.datalen + ICMP_MINLEN);
 
-    sendping_tail(sock, ICMP_MINLEN);
+    sendping_tail();
 }
 
 static const char *icmp_type_name(int id)
@@ -232,27 +231,18 @@ static void unpack4(char *buf, int sz, struct sockaddr_in *from)
 
 int main(void)
 {
-    #if 0
-    int sock = -1;
-    int g_popt.recv_len = 0;
-    int g_popt.datalen = 16;
-    char *g_port.recv_pkt = NULL;
-    int pingcount = 0;
-    #endif
-
     g_popt.myid = (uint16_t) getpid();
 
     memset(&g_popt.dest_addr, 0, sizeof(g_popt.dest_addr));                                          
     g_popt.dest_addr.sin_family = AF_INET;                                                
 
     struct hostent *host;
-    host=gethostbyname("qq.com");
+    host = gethostbyname("qq.com");
     if (host ==NULL) {                                     
         printf("[NetStatus]  error : Can't get serverhost info!\n"); 
         return -1;                                                                 
     }                                                                              
 
-    //memcpy((char*)host->h_addr,(char*)&g_popt.dest_addr.sin_addr, host->h_length);        
     memcpy((char*)&g_popt.dest_addr.sin_addr, (char*)host->h_addr, host->h_length);        
 
     printf("\tofficial: %s\n", host->h_name);
@@ -266,7 +256,6 @@ int main(void)
 
     g_popt.sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP); /* 1 == ICMP */
     if (g_popt.sock < 0) {
-        perror("g_popt.sock");
         printf("socket failed.\n");
         return -1;
     }
@@ -308,5 +297,18 @@ int main(void)
     } while(0);
 
     return 0;
+
+error:
+    if (g_popt.sock >= 0) {
+        close(g_popt.sock);
+        g_popt.sock = -1;
+    }
+
+    if (g_popt.recv_pkt) {
+        free(g_popt.recv_pkt);
+        g_popt.recv_pkt = NULL;
+    }
+
+    return -1;
 }
 
