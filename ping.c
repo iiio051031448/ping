@@ -154,7 +154,7 @@ static int sendping_tail(void)
     return 0;
 }
 
-static void sendping4(int sock)
+static int sendping4(int sock)
 {
     struct icmp *pkt = (struct icmp*)g_popt.snd_packet;
 
@@ -174,7 +174,7 @@ static void sendping4(int sock)
 
     pkt->icmp_cksum = inet_cksum((uint16_t *) pkt, g_popt.datalen + ICMP_MINLEN);
 
-    sendping_tail();
+    return sendping_tail();
 }
 
 static const char *icmp_type_name(int id)
@@ -197,7 +197,7 @@ static const char *icmp_type_name(int id)
     }
 }
 
-static void unpack4(char *buf, int sz, struct sockaddr_in *from)
+static int unpack4(char *buf, int sz, struct sockaddr_in *from)
 {
     struct icmp *icmppkt;
     struct iphdr *iphdr;
@@ -205,7 +205,7 @@ static void unpack4(char *buf, int sz, struct sockaddr_in *from)
 
     /* discard if too short */
     if (sz < (g_popt.datalen + ICMP_MINLEN))
-        return;
+        return -1;
 
     /* check IP header */
     iphdr = (struct iphdr *) buf;
@@ -213,7 +213,7 @@ static void unpack4(char *buf, int sz, struct sockaddr_in *from)
     sz -= hlen;
     icmppkt = (struct icmp *) (buf + hlen);
     if (icmppkt->icmp_id != g_popt.myid)
-        return;             /* not our ping */
+        return -1;             /* not our ping */
 
     if (icmppkt->icmp_type == ICMP_ECHOREPLY) {
         uint16_t recv_seq = ntohs(icmppkt->icmp_seq);
@@ -224,20 +224,39 @@ static void unpack4(char *buf, int sz, struct sockaddr_in *from)
         printf("GOT ICMP_ECHOREPLY\n");
     } else if (icmppkt->icmp_type != ICMP_ECHO) {
         printf("warning: got ICMP %d (%s)\n", icmppkt->icmp_type, icmp_type_name(icmppkt->icmp_type));
+        return -1;
     }
 
-    return;
+    return 0;
 }
 
-int main(void)
+static int popt_release(void)
 {
-    g_popt.myid = (uint16_t) getpid();
+    if (g_popt.sock >= 0) {
+        close(g_popt.sock);
+        g_popt.sock = -1;
+    }
 
+    if (g_popt.recv_pkt) {
+        free(g_popt.recv_pkt);
+        g_popt.recv_pkt = NULL;
+    }
+
+    if (g_popt.snd_packet) {
+        free(g_popt.snd_packet);
+        g_popt.snd_packet = NULL;
+    }
+
+    return 0;
+}
+
+static int set_host(const char *name)
+{
     memset(&g_popt.dest_addr, 0, sizeof(g_popt.dest_addr));                                          
     g_popt.dest_addr.sin_family = AF_INET;                                                
 
     struct hostent *host;
-    host = gethostbyname("qq.com");
+    host = gethostbyname(name);
     if (host ==NULL) {                                     
         printf("[NetStatus]  error : Can't get serverhost info!\n"); 
         return -1;                                                                 
@@ -254,6 +273,19 @@ int main(void)
         printf("\taddress: %s\n", inet_ntop(host->h_addrtype, host->h_addr, str, sizeof(str)));
     }
 
+    return 0;
+}
+
+int popt_init(const char *name, int datalen)
+{
+    g_popt.myid = (uint16_t) getpid();
+    g_popt.datalen = datalen;
+
+    if (set_host(name)) {
+        printf("get host failed of %s\n", name);
+        return -1;
+    }
+
     g_popt.sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP); /* 1 == ICMP */
     if (g_popt.sock < 0) {
         printf("socket failed.\n");
@@ -261,15 +293,18 @@ int main(void)
     }
 
     g_popt.recv_len = g_popt.datalen + MAXIPLEN + MAXICMPLEN;
-
     g_popt.recv_pkt = malloc(g_popt.recv_len);
     if (!g_popt.recv_pkt) {
+        printf("oom.");
+        return -1;
     }
     memset(g_popt.recv_pkt, 0, g_popt.recv_len);
 
     g_popt.snd_len = g_popt.datalen + ICMP_MINLEN + 4;
     g_popt.snd_packet = malloc(g_popt.snd_len);
     if (!g_popt.snd_packet) {
+        printf("oom.");
+        return -1;
     }
     memset(g_popt.snd_packet, 0, g_popt.snd_len);
 
@@ -279,36 +314,75 @@ int main(void)
     sockopt = (g_popt.datalen * 2) + 7 * 1024; /* giving it a bit of extra room */
     setsockopt_SOL_SOCKET_int(g_popt.sock, SO_RCVBUF, sockopt);
 
-    sendping4(g_popt.sock);
+    return 0;
+}
 
-    do {
-        struct sockaddr_in from;
-        socklen_t fromlen = (socklen_t) sizeof(from);
-        int c;
+int recv_packet(void)
+{           
+    int n = 0;
+    int ret = -1;
+    int sret = 0;
+    struct timeval tv;
+    fd_set rfds;
+    struct sockaddr_in from;
+    socklen_t fromlen = (socklen_t) sizeof(from);
 
-        printf("recvfrom ..... \n");
-        c = recvfrom(g_popt.sock, g_popt.recv_pkt, g_popt.recv_len, 0, (struct sockaddr *) &from, &fromlen);
-        if (c < 0) {
-            if (errno != EINTR) {
-                printf("recvfrom error\n");
-            }
+    FD_ZERO(&rfds);
+    FD_SET(g_popt.sock, &rfds);
+
+    tv.tv_sec = 4;
+    tv.tv_usec = 0;
+    while(1) {
+        sret = select(g_popt.sock + 1, &rfds, NULL, NULL, &tv);
+        if (sret == 0) {
+            printf("time out\n");
+            return -1;
+        } else if (sret < 0) {
+            printf("select error\n");
+            return -1;
         }
-        unpack4(g_popt.recv_pkt, c, &from);
-    } while(0);
+        if (FD_ISSET(g_popt.sock,&rfds)) {  
+            n = recvfrom(g_popt.sock, g_popt.recv_pkt, g_popt.recv_len, 0, (struct sockaddr *) &from, &fromlen);
+            if(n <0) {   
+                if(errno==EINTR)
+                    return -1;
+                perror("recvfrom error");
+                return -2;
+            }
+
+            ret = unpack4(g_popt.recv_pkt, n, &from);
+        }
+
+        if(ret == -1) {
+            continue;
+        }
+        return ret;
+    }
+}
+
+
+int try_ping(const char *name, int datalen)
+{   
+    if (popt_init(name, datalen)) {
+        goto error;
+    }
+
+    if (sendping4(g_popt.sock)) {
+        goto error;
+    }
+
+    recv_packet();
+
+    popt_release();
 
     return 0;
 
 error:
-    if (g_popt.sock >= 0) {
-        close(g_popt.sock);
-        g_popt.sock = -1;
-    }
-
-    if (g_popt.recv_pkt) {
-        free(g_popt.recv_pkt);
-        g_popt.recv_pkt = NULL;
-    }
-
+    popt_release();
     return -1;
 }
 
+int main(void)
+{
+    try_ping("qq.com", 16);
+}
