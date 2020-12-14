@@ -330,7 +330,7 @@ int recv_packet(void)
     FD_ZERO(&rfds);
     FD_SET(g_popt.sock, &rfds);
 
-    tv.tv_sec = 4;
+    tv.tv_sec = 1;
     tv.tv_usec = 0;
     while(1) {
         sret = select(g_popt.sock + 1, &rfds, NULL, NULL, &tv);
@@ -364,14 +364,19 @@ int recv_packet(void)
 int try_ping(const char *name, int datalen)
 {   
     if (popt_init(name, datalen)) {
+        printf("popt init failed.\n");
         goto error;
     }
 
     if (sendping4(g_popt.sock)) {
+        printf("send ping failed.\n");
         goto error;
     }
 
-    recv_packet();
+    if (recv_packet()) {
+        printf("recv ping ack failed.\n");
+        goto error;
+    }
 
     popt_release();
 
@@ -384,5 +389,11 @@ error:
 
 int main(void)
 {
-    try_ping("qq.com", 16);
+    int i = 100;
+    while(i--) {
+        printf("==== %d ====\n", i);
+        if (try_ping("127.0.0.1", 16)) {
+            break;
+        }
+    }
 }
