@@ -230,7 +230,6 @@ static int do_unpack4(pingopt_t *pingopt, int sz, struct sockaddr_in *from)
         printf("GOT ICMP_ECHOREPLY\n");
     } else if (icmppkt->icmp_type != ICMP_ECHO) {
         printf("warning: got ICMP %d (%s)\n", icmppkt->icmp_type, icmp_type_name(icmppkt->icmp_type));
-        P_LOG("========>");
         return -1;
     }
 
