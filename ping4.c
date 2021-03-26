@@ -171,7 +171,7 @@ static int send_ping4(pingopt_t *pingopt)
      *       */
     /*if (pingopt->datalen >= 4)*/
     /* No hton: we'll read it back on the same machine */
-    *(uint32_t*)&pkt->icmp_dun = monotonic_us();
+    *(uint64_t*)&pkt->icmp_dun = monotonic_us();
 
     pkt->icmp_cksum = inet_cksum((uint16_t *) pkt, pingopt->datalen + ICMP_MINLEN);
 
@@ -227,7 +227,10 @@ static int do_unpack4(pingopt_t *pingopt, int sz, struct sockaddr_in *from)
 
         if (sz >= ICMP_MINLEN + sizeof(uint32_t))
             tp = (uint32_t *) icmppkt->icmp_data;
-        printf("GOT ICMP_ECHOREPLY\n");
+
+        uint64_t now_us = monotonic_us();
+        uint64_t req_us = *(uint64_t*)&icmppkt->icmp_dun;
+        printf("GOT ICMP_ECHOREPLY, req_us:%lld, now_us:%lld, time:%lld us\n", req_us, now_us, now_us - req_us);
     } else if (icmppkt->icmp_type != ICMP_ECHO) {
         printf("warning: got ICMP %d (%s)\n", icmppkt->icmp_type, icmp_type_name(icmppkt->icmp_type));
         return -1;
@@ -398,6 +401,8 @@ error:
 int main(void)
 {
     int i = 1;
+    struct icmp *pkt;
+    printf("==== %ld ====\n", sizeof(pkt->icmp_dun));
     while(i--) {
         printf("==== %d ====\n", i);
         if (try_ping("172.31.0.1", 16)) {
