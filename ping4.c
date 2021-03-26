@@ -14,6 +14,9 @@
 #include <sys/syscall.h>
 #include <arpa/inet.h>
 
+#define P_LOG(fmt, ...) \
+    printf("[%s][%d]"fmt"\n", __func__, __LINE__, ##__VA_ARGS__)
+
 enum {
     DEF_DATALEN = 56,
     MAXIPLEN = 60,
@@ -42,8 +45,6 @@ typedef struct pingopt_tag {
     struct sockaddr_in dest_addr;
     unsigned long ntransmitted;
 }pingopt_t;
-
-static pingopt_t g_pingopt = {0};
 
 int setsockopt_int(int fd, int level, int optname, int optval)
 {
@@ -197,24 +198,29 @@ static const char *icmp_type_name(int id)
     }
 }
 
-static int unpack4(pingopt_t *pingopt, int sz, struct sockaddr_in *from)
+static int do_unpack4(pingopt_t *pingopt, int sz, struct sockaddr_in *from)
 {
     struct icmp *icmppkt;
     struct iphdr *iphdr;
     int hlen;
 
     /* discard if too short */
-    if (sz < (pingopt->datalen + ICMP_MINLEN))
+    if (sz < (pingopt->datalen + ICMP_MINLEN)) {
+        printf("error too short\n");
         return -1;
+    }
 
     /* check IP header */
     iphdr = (struct iphdr *) pingopt->recv_pkt;
     hlen = iphdr->ihl << 2;
     sz -= hlen;
     icmppkt = (struct icmp *) (pingopt->recv_pkt + hlen);
-    if (icmppkt->icmp_id != pingopt->myid)
+    if (icmppkt->icmp_id != pingopt->myid) {
+        printf("not our ping\n");
         return -1;             /* not our ping */
+    }
 
+    P_LOG("icmp_type:%d (%s)\n", icmppkt->icmp_type, icmp_type_name(icmppkt->icmp_type));
     if (icmppkt->icmp_type == ICMP_ECHOREPLY) {
         uint16_t recv_seq = ntohs(icmppkt->icmp_seq);
         uint32_t *tp = NULL;
@@ -224,6 +230,7 @@ static int unpack4(pingopt_t *pingopt, int sz, struct sockaddr_in *from)
         printf("GOT ICMP_ECHOREPLY\n");
     } else if (icmppkt->icmp_type != ICMP_ECHO) {
         printf("warning: got ICMP %d (%s)\n", icmppkt->icmp_type, icmp_type_name(icmppkt->icmp_type));
+        P_LOG("========>");
         return -1;
     }
 
@@ -250,10 +257,10 @@ static int pingopt_release(pingopt_t *pingopt)
     return 0;
 }
 
-static int set_host(const char *name)
+static int set_host(pingopt_t *pingopt, const char *name)
 {
-    memset(&g_pingopt.dest_addr, 0, sizeof(g_pingopt.dest_addr));                                          
-    g_pingopt.dest_addr.sin_family = AF_INET;                                                
+    memset(&pingopt->dest_addr, 0, sizeof(pingopt->dest_addr));                                          
+    pingopt->dest_addr.sin_family = AF_INET;                                                
 
     struct hostent *host;
     host = gethostbyname(name);
@@ -262,7 +269,7 @@ static int set_host(const char *name)
         return -1;                                                                 
     }                                                                              
 
-    memcpy((char*)&g_pingopt.dest_addr.sin_addr, (char*)host->h_addr, host->h_length);        
+    memcpy((char*)&pingopt->dest_addr.sin_addr, (char*)host->h_addr, host->h_length);        
 
     printf("\tofficial: %s\n", host->h_name);
 
@@ -281,7 +288,7 @@ int pingopt_init(const char *name, int datalen, pingopt_t *pingopt)
     pingopt->myid = (uint16_t) getpid();
     pingopt->datalen = datalen;
 
-    if (set_host(name)) {
+    if (set_host(pingopt, name)) {
         printf("get host failed of %s\n", name);
         return -1;
     }
@@ -350,7 +357,7 @@ int recv_packet(pingopt_t *pingopt)
                 return -2;
             }
 
-            ret = unpack4(pingopt, n, &from);
+            ret = do_unpack4(pingopt, n, &from);
         }
 
         if(ret == -1) {
@@ -391,7 +398,7 @@ error:
 
 int main(void)
 {
-    int i = 100;
+    int i = 1;
     while(i--) {
         printf("==== %d ====\n", i);
         if (try_ping("172.31.0.1", 16)) {
